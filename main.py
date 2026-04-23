@@ -472,13 +472,35 @@ def get_833_m3u():
     try:
         response = requests.get(LIVE833_API_URL, headers=LIVE833_HEADERS, timeout=8)
         response.raise_for_status()
-        m3u_body = build_833_m3u_content(response.json())
+        streams = extract_833_streams(response.json())
+        m3u_body = build_833_m3u_content(streams)
         return (
             m3u_body,
             200,
             {
                 "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
                 "Content-Disposition": 'inline; filename="live.m3u"',
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    except requests.RequestException as e:
+        return f"上游抓取失败，错误详情: {e}", 502
+    except ValueError:
+        return "上游返回非 JSON 数据", 502
+
+@app.route('/833_txt')
+def get_833_txt():
+    try:
+        response = requests.get(LIVE833_API_URL, headers=LIVE833_HEADERS, timeout=8)
+        response.raise_for_status()
+        streams = extract_833_streams(response.json())
+        txt_body = build_833_txt_content(streams)
+        return (
+            txt_body,
+            200,
+            {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Disposition": 'inline; filename="live.txt"',
                 "Access-Control-Allow-Origin": "*",
             },
         )
@@ -538,27 +560,74 @@ def debug_url():
     return jsonify(debug_info)
 
 
-def build_833_m3u_content(payload):
-    m3u_content = ["#EXTM3U"]
+def extract_833_streams(payload):
+    streams = []
     ongoing_livestreams = ((payload or {}).get("data") or {}).get("ongoingLivestreams") or []
 
-    for stream in ongoing_livestreams:
-        name = stream.get("houseName") or stream.get("nickName")
-        if not name or "播" in name:
-            continue
+    for item in ongoing_livestreams:
+        match_name = item.get("houseName") or item.get("houseNameEn") or "未知赛事"
+        raw_nick_name = (item.get("nickName") or "").strip()
+        logo = item.get("userImage") or ""
 
-        stream_url = stream.get("playStreamAddress2") or stream.get("playStreamAddress")
-        if not stream_url:
-            continue
+        is_satellite = ("卫星" in raw_nick_name) or (raw_nick_name == "")
+        group_title = "卫星线路" if is_satellite else "主播线路"
+        display_nick_name = raw_nick_name if raw_nick_name else "原声信号"
 
-        user_image = stream.get("userImage") or ""
-        group_name = stream.get("houseNameEn") or "体育直播"
-        m3u_content.append(
-            f'#EXTINF:-1 tvg-name="{name}" tvg-logo="{user_image}" group-title="{group_name}",{name}'
+        play_stream_address = item.get("playStreamAddress")
+        if play_stream_address:
+            streams.append(
+                {
+                    "match": match_name,
+                    "title": f"{match_name}-{display_nick_name}-FLV",
+                    "url": play_stream_address,
+                    "group": group_title,
+                    "logo": logo,
+                }
+            )
+
+        play_stream_address2 = item.get("playStreamAddress2")
+        if play_stream_address2:
+            streams.append(
+                {
+                    "match": match_name,
+                    "title": f"{match_name}-{display_nick_name}-M3U8",
+                    "url": play_stream_address2,
+                    "group": group_title,
+                    "logo": logo,
+                }
+            )
+
+    streams.sort(key=lambda s: s.get("match") or "")
+    return streams
+
+def build_833_m3u_content(streams):
+    m3u_lines = ["#EXTM3U"]
+    for stream in streams:
+        m3u_lines.append(
+            f'#EXTINF:-1 tvg-name="{stream["title"]}" tvg-logo="{stream["logo"]}" group-title="{stream["group"]}",{stream["title"]}'
         )
-        m3u_content.append(stream_url)
+        m3u_lines.append(stream["url"])
+    return "\n".join(m3u_lines) + "\n"
 
-    return "\n".join(m3u_content) + "\n"
+def build_833_txt_content(streams):
+    txt_lines = []
+    anchor_streams = [stream for stream in streams if stream.get("group") == "主播线路"]
+    satellite_streams = [stream for stream in streams if stream.get("group") == "卫星线路"]
+
+    if anchor_streams:
+        txt_lines.append("主播线路,#genre#")
+        for stream in anchor_streams:
+            txt_lines.append(f'{stream["title"]},{stream["url"]}')
+        txt_lines.append("")
+
+    if satellite_streams:
+        txt_lines.append("卫星线路,#genre#")
+        for stream in satellite_streams:
+            txt_lines.append(f'{stream["title"]},{stream["url"]}')
+
+    if not txt_lines:
+        return ""
+    return "\n".join(txt_lines) + "\n"
 
 def run_scheduler():
     schedule.every(11).minutes.do(generate_playlist)
