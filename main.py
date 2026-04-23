@@ -504,6 +504,27 @@ def get_833_txt():
     except requests.RequestException as e:
         return f"上游抓取失败，错误详情: {e}", 502
 
+@app.route('/833_txt')
+def get_833_txt():
+    try:
+        response = requests.get(LIVE833_API_URL, headers=LIVE833_HEADERS, timeout=8)
+        response.raise_for_status()
+        streams = extract_833_streams(response.json())
+        txt_body = build_833_txt_content(streams)
+        return (
+            txt_body,
+            200,
+            {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Disposition": 'inline; filename="live.txt"',
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    except requests.RequestException as e:
+        return f"上游抓取失败，错误详情: {e}", 502
+    except ValueError:
+        return "上游返回非 JSON 数据", 502
+
 @app.route('/txt')
 def get_txt():
     try: return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
