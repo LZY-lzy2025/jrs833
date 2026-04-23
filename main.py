@@ -565,6 +565,7 @@ def _fetch_833_ongoing_livestreams(api_url):
         payload = response.json()
         data = ((payload or {}).get("data") or {})
         extracted = []
+        time_map = {}
 
         ongoing_livestreams = data.get("ongoingLivestreams")
         if isinstance(ongoing_livestreams, list):
@@ -584,40 +585,72 @@ def _fetch_833_ongoing_livestreams(api_url):
                 if not isinstance(match_item, dict):
                     continue
 
-                reserved_anchors = match_item.get("reservedAnchors")
-                if isinstance(reserved_anchors, list):
-                    extracted.extend(reserved_anchors)
+                raw_match_time = match_item.get("matchTime")
+                if isinstance(raw_match_time, (int, float)):
+                    match_time_ms = int(raw_match_time * 1000)
+                else:
+                    match_time_ms = int(time.time() * 1000)
 
+                reserved_anchors = match_item.get("reservedAnchors")
                 match_data = (((match_item.get("result") or {}).get("match")) or {})
+                standard_name = ""
                 video_url = match_data.get("videoUrl")
-                if isinstance(video_url, str) and video_url.startswith("http"):
-                    home_name = (((match_data.get("homeTeam") or {}).get("name")) or "")
-                    away_name = (((match_data.get("awayTeam") or {}).get("name")) or "")
-                    competition = (match_data.get("competition") or {})
-                    competition_name = competition.get("name") or "体育赛事"
-                    competition_logo = competition.get("logo") or ""
+                home_name = (((match_data.get("homeTeam") or {}).get("name")) or "")
+                away_name = (((match_data.get("awayTeam") or {}).get("name")) or "")
+                competition = (match_data.get("competition") or {})
+                competition_name = competition.get("name") or "体育赛事"
+                competition_logo = competition.get("logo") or ""
+                standard_name = re.sub(r"\s+", " ", f"{competition_name} {home_name}VS{away_name}".strip())
+                if standard_name:
+                    time_map[standard_name] = match_time_ms
+
+                if isinstance(reserved_anchors, list):
+                    for reserved_anchor in reserved_anchors:
+                        if not isinstance(reserved_anchor, dict):
+                            continue
+                        house_name = re.sub(r"\s+", " ", (reserved_anchor.get("houseName") or "").strip())
+                        if house_name:
+                            time_map[house_name] = match_time_ms
+                        extracted.append(reserved_anchor)
+
+                if isinstance(video_url, str) and len(video_url) > 15:
+                    best_name = standard_name
+                    if isinstance(reserved_anchors, list) and reserved_anchors:
+                        first_anchor_name = re.sub(
+                            r"\s+",
+                            " ",
+                            ((reserved_anchors[0].get("houseName") or "").strip()) if isinstance(reserved_anchors[0], dict) else "",
+                        )
+                        if first_anchor_name:
+                            best_name = first_anchor_name
+
                     extracted.append(
                         {
-                            "houseName": f"{competition_name} {home_name}VS{away_name}",
+                            "houseName": best_name or standard_name,
                             "nickName": "官方源",
                             "playStreamAddress2": video_url,
                             "userImage": competition_logo,
+                            "_exactTime": match_time_ms,
                         }
                     )
-        return extracted
+        return extracted, time_map
     except Exception as e:
         print(f"请求833接口失败 [{api_url}]: {e}")
-        return []
+        return [], {}
 
 def extract_833_streams():
     streams = []
     all_livestreams = []
     unique_urls = set()
+    global_time_map = {}
+    now = int(time.time() * 1000)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(LIVE833_API_URLS)) as executor:
         futures = [executor.submit(_fetch_833_ongoing_livestreams, api_url) for api_url in LIVE833_API_URLS]
         for future in concurrent.futures.as_completed(futures):
-            all_livestreams.extend(future.result())
+            items, time_map = future.result()
+            all_livestreams.extend(items)
+            global_time_map.update(time_map)
 
     for item in all_livestreams:
         match_name = (item.get("houseName") or item.get("houseNameEn") or "未知赛事").strip()
@@ -626,6 +659,8 @@ def extract_833_streams():
             match_name = "未知赛事"
         raw_nick_name = (item.get("nickName") or "").strip()
         logo = item.get("userImage") or ""
+        stream_time = item.get("_exactTime") or global_time_map.get(match_name) or now
+        time_diff = abs(int(stream_time) - now)
 
         is_satellite = ("卫星" in raw_nick_name) or (raw_nick_name == "官方源") or (raw_nick_name == "")
         group_title = "卫星线路" if is_satellite else "主播线路"
@@ -645,6 +680,7 @@ def extract_833_streams():
                     "url": play_stream_address,
                     "group": group_title,
                     "logo": logo,
+                    "timeDiff": time_diff,
                 }
             )
 
@@ -662,10 +698,11 @@ def extract_833_streams():
                     "url": play_stream_address2,
                     "group": group_title,
                     "logo": logo,
+                    "timeDiff": time_diff,
                 }
             )
 
-    streams.sort(key=lambda s: s.get("match") or "")
+    streams.sort(key=lambda s: (s.get("timeDiff", 0), s.get("match") or ""))
     return streams
 
 def build_833_m3u_content(streams):
