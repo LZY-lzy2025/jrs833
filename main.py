@@ -555,6 +555,13 @@ def debug_url():
     return jsonify(debug_info)
 
 
+def format_833_time(timestamp_ms):
+    if not timestamp_ms:
+        return "[直播中]"
+    utc_dt = datetime.datetime.utcfromtimestamp(int(timestamp_ms) / 1000)
+    beijing_dt = utc_dt + datetime.timedelta(hours=8)
+    return f'[{beijing_dt.strftime("%H:%M")}]'
+
 def _fetch_833_ongoing_livestreams(api_url):
     referer_url = urllib.parse.urlsplit(api_url)
     referer = f"{referer_url.scheme}://{referer_url.netloc}/"
@@ -563,146 +570,143 @@ def _fetch_833_ongoing_livestreams(api_url):
         response = requests.get(api_url, headers=headers, timeout=8)
         response.raise_for_status()
         payload = response.json()
-        data = ((payload or {}).get("data") or {})
-        extracted = []
-        time_map = {}
-
-        ongoing_livestreams = data.get("ongoingLivestreams")
-        if isinstance(ongoing_livestreams, list):
-            extracted.extend(ongoing_livestreams)
-
-        anchor_livestreams = data.get("anchorLivestreams")
-        if isinstance(anchor_livestreams, list):
-            extracted.extend(anchor_livestreams)
-
-        streaming_anchor_ranking = data.get("streamingAnchorRanking")
-        if isinstance(streaming_anchor_ranking, list):
-            extracted.extend(streaming_anchor_ranking)
-
-        match_livestreams = data.get("matchLivestreams")
-        if isinstance(match_livestreams, list):
-            for match_item in match_livestreams:
-                if not isinstance(match_item, dict):
-                    continue
-
-                raw_match_time = match_item.get("matchTime")
-                if isinstance(raw_match_time, (int, float)):
-                    match_time_ms = int(raw_match_time * 1000)
-                else:
-                    match_time_ms = int(time.time() * 1000)
-
-                reserved_anchors = match_item.get("reservedAnchors")
-                match_data = (((match_item.get("result") or {}).get("match")) or {})
-                standard_name = ""
-                video_url = match_data.get("videoUrl")
-                home_name = (((match_data.get("homeTeam") or {}).get("name")) or "")
-                away_name = (((match_data.get("awayTeam") or {}).get("name")) or "")
-                competition = (match_data.get("competition") or {})
-                competition_name = competition.get("name") or "体育赛事"
-                competition_logo = competition.get("logo") or ""
-                standard_name = re.sub(r"\s+", " ", f"{competition_name} {home_name}VS{away_name}".strip())
-                if standard_name:
-                    time_map[standard_name] = match_time_ms
-
-                if isinstance(reserved_anchors, list):
-                    for reserved_anchor in reserved_anchors:
-                        if not isinstance(reserved_anchor, dict):
-                            continue
-                        house_name = re.sub(r"\s+", " ", (reserved_anchor.get("houseName") or "").strip())
-                        if house_name:
-                            time_map[house_name] = match_time_ms
-                        extracted.append(reserved_anchor)
-
-                if isinstance(video_url, str) and len(video_url) > 15:
-                    best_name = standard_name
-                    if isinstance(reserved_anchors, list) and reserved_anchors:
-                        first_anchor_name = re.sub(
-                            r"\s+",
-                            " ",
-                            ((reserved_anchors[0].get("houseName") or "").strip()) if isinstance(reserved_anchors[0], dict) else "",
-                        )
-                        if first_anchor_name:
-                            best_name = first_anchor_name
-
-                    extracted.append(
-                        {
-                            "houseName": best_name or standard_name,
-                            "nickName": "官方源",
-                            "playStreamAddress2": video_url,
-                            "userImage": competition_logo,
-                            "_exactTime": match_time_ms,
-                        }
-                    )
-        return extracted, time_map
+        return ((payload or {}).get("data") or {})
     except Exception as e:
         print(f"请求833接口失败 [{api_url}]: {e}")
-        return [], {}
+        return {}
 
 def extract_833_streams():
     streams = []
-    all_livestreams = []
     unique_urls = set()
-    global_time_map = {}
+    all_rooms = {}
+    house_time_map = {}
+    house_name_map = {}
+    official_streams = []
     now = int(time.time() * 1000)
+    expire_limit = 10 * 60 * 60 * 1000
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(LIVE833_API_URLS)) as executor:
         futures = [executor.submit(_fetch_833_ongoing_livestreams, api_url) for api_url in LIVE833_API_URLS]
         for future in concurrent.futures.as_completed(futures):
-            items, time_map = future.result()
-            all_livestreams.extend(items)
-            global_time_map.update(time_map)
+            data = future.result()
+            if not data:
+                continue
 
-    for item in all_livestreams:
-        match_name = (item.get("houseName") or item.get("houseNameEn") or "未知赛事").strip()
-        match_name = re.sub(r"\s+", " ", match_name)
+            match_livestreams = data.get("matchLivestreams")
+            if isinstance(match_livestreams, list):
+                for match_item in match_livestreams:
+                    if not isinstance(match_item, dict):
+                        continue
+                    raw_match_time = match_item.get("matchTime")
+                    match_time = int(raw_match_time * 1000) if isinstance(raw_match_time, (int, float)) else 0
+                    if match_time > 0 and now - match_time > expire_limit:
+                        continue
+
+                    match_data = (((match_item.get("result") or {}).get("match")) or {})
+                    reserved_anchors = match_item.get("reservedAnchors")
+
+                    best_name = ""
+                    if isinstance(reserved_anchors, list) and reserved_anchors:
+                        first_reserved = reserved_anchors[0] if isinstance(reserved_anchors[0], dict) else {}
+                        best_name = re.sub(r"\s+", " ", (first_reserved.get("houseName") or "").strip())
+
+                    if not best_name and match_data:
+                        home = (((match_data.get("homeTeam") or {}).get("name")) or "")
+                        away = (((match_data.get("awayTeam") or {}).get("name")) or "")
+                        comp = (((match_data.get("competition") or {}).get("name")) or "体育赛事")
+                        best_name = re.sub(r"\s+", " ", f"{comp} {home}VS{away}".strip())
+                    if not best_name:
+                        best_name = "未知赛事"
+
+                    if isinstance(reserved_anchors, list):
+                        for anchor in reserved_anchors:
+                            if not isinstance(anchor, dict):
+                                continue
+                            house_id = anchor.get("houseId")
+                            if house_id:
+                                house_time_map[house_id] = match_time
+                                house_name_map[house_id] = best_name
+                                all_rooms[house_id] = anchor
+
+                    video_url = match_data.get("videoUrl")
+                    if isinstance(video_url, str) and len(video_url) > 15 and video_url.startswith("http"):
+                        logo = ((match_data.get("competition") or {}).get("logo")) or ""
+                        official_streams.append(
+                            {
+                                "match": best_name,
+                                "title": f'{format_833_time(match_time)} {best_name}-官方源-M3U8',
+                                "base_url": video_url.split("?")[0],
+                                "url": video_url,
+                                "group": "卫星线路",
+                                "logo": logo,
+                                "timeDiff": abs(now - match_time) if match_time else 0,
+                            }
+                        )
+
+            for arr in [data.get("ongoingLivestreams"), data.get("anchorLivestreams"), data.get("streamingAnchorRanking")]:
+                if isinstance(arr, list):
+                    for item in arr:
+                        if not isinstance(item, dict):
+                            continue
+                        house_id = item.get("houseId")
+                        if house_id and house_id not in all_rooms:
+                            all_rooms[house_id] = item
+
+    def add_stream(match, title, url, group, logo, time_diff):
+        if not isinstance(url, str) or len(url) < 15 or not url.startswith("http"):
+            return
+        base_url = url.split("?")[0]
+        if base_url in unique_urls:
+            return
+        unique_urls.add(base_url)
+        streams.append({"match": match, "title": title, "url": url, "group": group, "logo": logo or "", "timeDiff": time_diff})
+
+    for official in official_streams:
+        add_stream(official["match"], official["title"], official["url"], official["group"], official["logo"], official["timeDiff"])
+
+    for room in all_rooms.values():
+        house_id = room.get("houseId")
+        match_time = house_time_map.get(house_id) if house_id else None
+        if match_time is not None and match_time > 0 and now - match_time > expire_limit:
+            continue
+        time_diff = abs(now - match_time) if match_time else 0
+        time_tag = format_833_time(match_time)
+
+        match_name = house_name_map.get(house_id) if house_id else None
+        if not match_name:
+            match_name = re.sub(r"\s+", " ", (room.get("houseName") or room.get("houseNameEn") or "未知赛事").strip())
         if match_name in {"0", "1"}:
             match_name = "未知赛事"
-        raw_nick_name = (item.get("nickName") or "").strip()
-        logo = item.get("userImage") or ""
-        stream_time = item.get("_exactTime") or global_time_map.get(match_name) or now
-        time_diff = abs(int(stream_time) - now)
 
+        raw_nick_name = (room.get("nickName") or "").strip()
         is_satellite = ("卫星" in raw_nick_name) or (raw_nick_name == "官方源") or (raw_nick_name == "")
         group_title = "卫星线路" if is_satellite else "主播线路"
         display_nick_name = raw_nick_name if raw_nick_name else "原声信号"
+        logo = room.get("userImage") or ""
 
-        play_stream_address = item.get("playStreamAddress")
-        if (
-            isinstance(play_stream_address, str)
-            and play_stream_address.startswith("http")
-            and play_stream_address not in unique_urls
-        ):
-            unique_urls.add(play_stream_address)
-            streams.append(
-                {
-                    "match": match_name,
-                    "title": f"{match_name}-{display_nick_name}-FLV",
-                    "url": play_stream_address,
-                    "group": group_title,
-                    "logo": logo,
-                    "timeDiff": time_diff,
-                }
+        play_stream_address = room.get("playStreamAddress")
+        if play_stream_address:
+            add_stream(
+                match_name,
+                f"{time_tag} {match_name}-{display_nick_name}-FLV",
+                play_stream_address,
+                group_title,
+                logo,
+                time_diff,
             )
 
-        play_stream_address2 = item.get("playStreamAddress2")
-        if (
-            isinstance(play_stream_address2, str)
-            and play_stream_address2.startswith("http")
-            and play_stream_address2 not in unique_urls
-        ):
-            unique_urls.add(play_stream_address2)
-            streams.append(
-                {
-                    "match": match_name,
-                    "title": f"{match_name}-{display_nick_name}-M3U8",
-                    "url": play_stream_address2,
-                    "group": group_title,
-                    "logo": logo,
-                    "timeDiff": time_diff,
-                }
+        play_stream_address2 = room.get("playStreamAddress2")
+        if play_stream_address2:
+            add_stream(
+                match_name,
+                f"{time_tag} {match_name}-{display_nick_name}-M3U8",
+                play_stream_address2,
+                group_title,
+                logo,
+                time_diff,
             )
 
-    streams.sort(key=lambda s: (s.get("timeDiff", 0), s.get("match") or ""))
+    streams.sort(key=lambda s: (s.get("timeDiff", 0), s.get("title") or ""))
     return streams
 
 def build_833_m3u_content(streams):
