@@ -563,7 +563,48 @@ def _fetch_833_ongoing_livestreams(api_url):
         response = requests.get(api_url, headers=headers, timeout=8)
         response.raise_for_status()
         payload = response.json()
-        return ((payload or {}).get("data") or {}).get("ongoingLivestreams") or []
+        data = ((payload or {}).get("data") or {})
+        extracted = []
+
+        ongoing_livestreams = data.get("ongoingLivestreams")
+        if isinstance(ongoing_livestreams, list):
+            extracted.extend(ongoing_livestreams)
+
+        anchor_livestreams = data.get("anchorLivestreams")
+        if isinstance(anchor_livestreams, list):
+            extracted.extend(anchor_livestreams)
+
+        streaming_anchor_ranking = data.get("streamingAnchorRanking")
+        if isinstance(streaming_anchor_ranking, list):
+            extracted.extend(streaming_anchor_ranking)
+
+        match_livestreams = data.get("matchLivestreams")
+        if isinstance(match_livestreams, list):
+            for match_item in match_livestreams:
+                if not isinstance(match_item, dict):
+                    continue
+
+                reserved_anchors = match_item.get("reservedAnchors")
+                if isinstance(reserved_anchors, list):
+                    extracted.extend(reserved_anchors)
+
+                match_data = (((match_item.get("result") or {}).get("match")) or {})
+                video_url = match_data.get("videoUrl")
+                if isinstance(video_url, str) and video_url.startswith("http"):
+                    home_name = (((match_data.get("homeTeam") or {}).get("name")) or "")
+                    away_name = (((match_data.get("awayTeam") or {}).get("name")) or "")
+                    competition = (match_data.get("competition") or {})
+                    competition_name = competition.get("name") or "体育赛事"
+                    competition_logo = competition.get("logo") or ""
+                    extracted.append(
+                        {
+                            "houseName": f"{competition_name} {home_name}VS{away_name}",
+                            "nickName": "官方源",
+                            "playStreamAddress2": video_url,
+                            "userImage": competition_logo,
+                        }
+                    )
+        return extracted
     except Exception as e:
         print(f"请求833接口失败 [{api_url}]: {e}")
         return []
@@ -581,15 +622,21 @@ def extract_833_streams():
     for item in all_livestreams:
         match_name = (item.get("houseName") or item.get("houseNameEn") or "未知赛事").strip()
         match_name = re.sub(r"\s+", " ", match_name)
+        if match_name in {"0", "1"}:
+            match_name = "未知赛事"
         raw_nick_name = (item.get("nickName") or "").strip()
         logo = item.get("userImage") or ""
 
-        is_satellite = ("卫星" in raw_nick_name) or (raw_nick_name == "")
+        is_satellite = ("卫星" in raw_nick_name) or (raw_nick_name == "官方源") or (raw_nick_name == "")
         group_title = "卫星线路" if is_satellite else "主播线路"
         display_nick_name = raw_nick_name if raw_nick_name else "原声信号"
 
         play_stream_address = item.get("playStreamAddress")
-        if play_stream_address and play_stream_address not in unique_urls:
+        if (
+            isinstance(play_stream_address, str)
+            and play_stream_address.startswith("http")
+            and play_stream_address not in unique_urls
+        ):
             unique_urls.add(play_stream_address)
             streams.append(
                 {
@@ -602,7 +649,11 @@ def extract_833_streams():
             )
 
         play_stream_address2 = item.get("playStreamAddress2")
-        if play_stream_address2 and play_stream_address2 not in unique_urls:
+        if (
+            isinstance(play_stream_address2, str)
+            and play_stream_address2.startswith("http")
+            and play_stream_address2 not in unique_urls
+        ):
             unique_urls.add(play_stream_address2)
             streams.append(
                 {
